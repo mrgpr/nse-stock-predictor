@@ -1,10 +1,10 @@
 name: Daily Prediction
 
-# on:
-#   schedule:
-#     # Runs Monday-Friday at 9:00 AM IST => 03:30 UTC
-#     - cron: '30 3 * * 1-5'
-#   workflow_dispatch:
+on:
+  schedule:
+    # Runs Monday-Friday at 9:00 AM IST => 03:30 UTC
+    - cron: '30 3 * * 1-5'
+  workflow_dispatch:
 
 permissions:
   contents: write
