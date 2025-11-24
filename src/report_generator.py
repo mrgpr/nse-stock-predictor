@@ -147,55 +147,139 @@ class ReportGenerator:
 <body><h1>{title}</h1><div><pre>{markdown_text}</pre></div></body></html>"""
         return html
 
-    def send_email_with_report(self, report_meta: dict, top_n: int = 5):
+    # def send_email_with_report(self, report_meta: dict, top_n: int = 5):
+    #     """
+    #     Sends an HTML email with top N picks and attaches CSV.
+    #     If running in GitHub Actions, expects EMAIL_USERNAME, EMAIL_PASSWORD, EMAIL_TO in env (set as secrets).
+    #     Locally, prompts user for credentials interactively to avoid storing secrets.
+    #     """
+    #     # Read CSV and HTML
+    #     html_path = report_meta["report_html"]
+    #     csv_path = report_meta["report_csv"]
+
+    #     # Compose email content
+    #     with open(report_meta["report_md"], "r", encoding="utf-8") as f:
+    #         md = f.read()
+    #     html_content = self._render_html(md, title=f"Stock Picks {report_meta['timestamp']}")
+
+    #     # Acquire credentials
+    #     email_user = os.environ.get("EMAIL_USERNAME")
+    #     email_pass = os.environ.get("EMAIL_PASSWORD")
+    #     email_to = os.environ.get("EMAIL_TO")
+
+    #     interactive = False
+    #     if not (email_user and email_pass and email_to):
+    #         # Interactive prompt for local runs
+    #         interactive = True
+    #         print("Email credentials not found in environment. For local testing, enter Gmail credentials (App Password recommended).")
+    #         email_user = input("Gmail address (from): ").strip()
+    #         email_to = input("Recipient email (to): ").strip()
+    #         import getpass
+    #         email_pass = getpass.getpass("Gmail App Password (16 chars): ")
+
+    #     # Build email
+    #     msg = EmailMessage()
+    #     msg["Subject"] = f"🔔 {report_meta.get('timestamp')} - {report_meta.get('folder').split('/')[-1]} - Stock Picks"
+    #     msg["From"] = formataddr(("Indian Stock Predictor", email_user))
+    #     msg["To"] = email_to
+    #     msg.set_content("This email contains HTML content. If you see this message, your email client may not support HTML.")
+    #     msg.add_alternative(html_content, subtype="html")
+
+    #     # Attach CSV
+    #     with open(csv_path, "rb") as f:
+    #         part = MIMEBase("application", "octet-stream")
+    #         part.set_payload(f.read())
+    #         encoders.encode_base64(part)
+    #         part.add_header("Content-Disposition", f"attachment; filename={Path(csv_path).name}")
+    #         msg.attach(part)
+
+    #     # Send via Gmail SMTP
+    #     try:
+    #         # Gmail SSL
+    #         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+    #             server.login(email_user, email_pass)
+    #             server.send_message(msg)
+    #             logger.info("Email sent to %s", email_to)
+    #     except Exception as e:
+    #         logger.exception("Failed to send email: %s", e)
+    #         if interactive:
+    #             print("Email sending failed. Check your app password and network.")
+
+        def send_email_with_report(self, report_meta: dict, top_n: int = 5):
         """
         Sends an HTML email with top N picks and attaches CSV.
-        If running in GitHub Actions, expects EMAIL_USERNAME, EMAIL_PASSWORD, EMAIL_TO in env (set as secrets).
-        Locally, prompts user for credentials interactively to avoid storing secrets.
+        Behavior:
+          - If running inside GitHub Actions and EMAIL_* env vars are NOT set, do NOT prompt (skip email).
+          - Locally (not in CI), prompt interactively if EMAIL_* are not set.
         """
         # Read CSV and HTML
         html_path = report_meta["report_html"]
         csv_path = report_meta["report_csv"]
 
         # Compose email content
-        with open(report_meta["report_md"], "r", encoding="utf-8") as f:
-            md = f.read()
-        html_content = self._render_html(md, title=f"Stock Picks {report_meta['timestamp']}")
+        try:
+            with open(report_meta["report_md"], "r", encoding="utf-8") as f:
+                md = f.read()
+        except Exception as e:
+            logger.exception("Failed reading markdown report: %s", e)
+            md = ""
+        html_content = self._render_html(md, title=f"Stock Picks {report_meta.get('timestamp')}")
 
-        # Acquire credentials
+        # Acquire credentials from environment
         email_user = os.environ.get("EMAIL_USERNAME")
         email_pass = os.environ.get("EMAIL_PASSWORD")
         email_to = os.environ.get("EMAIL_TO")
 
+        running_ci = os.environ.get("GITHUB_ACTIONS") == "true"
+
+        # If in CI and credentials missing, do not prompt: log and return gracefully
+        if running_ci and not (email_user and email_pass and email_to):
+            logger.info(
+                "Running in CI and email credentials not found. Skipping email send. "
+                "To enable emails from Actions, set repository secrets: EMAIL_USERNAME, EMAIL_PASSWORD, EMAIL_TO."
+            )
+            return
+
+        # If not in CI and credentials missing, prompt interactively
         interactive = False
         if not (email_user and email_pass and email_to):
-            # Interactive prompt for local runs
             interactive = True
-            print("Email credentials not found in environment. For local testing, enter Gmail credentials (App Password recommended).")
-            email_user = input("Gmail address (from): ").strip()
-            email_to = input("Recipient email (to): ").strip()
-            import getpass
-            email_pass = getpass.getpass("Gmail App Password (16 chars): ")
+            try:
+                print("Email credentials not found in environment. For local testing, enter Gmail credentials (App Password recommended).")
+                email_user = input("Gmail address (from): ").strip()
+                email_to = input("Recipient email (to): ").strip()
+                import getpass
+                email_pass = getpass.getpass("Gmail App Password (16 chars): ")
+            except Exception as e:
+                logger.exception("Interactive prompt failed or not available: %s", e)
+                # Do not raise in non-interactive environments
+                return
+
+        if not (email_user and email_pass and email_to):
+            logger.warning("Email credentials incomplete; skipping email.")
+            return
 
         # Build email
         msg = EmailMessage()
-        msg["Subject"] = f"🔔 {report_meta.get('timestamp')} - {report_meta.get('folder').split('/')[-1]} - Stock Picks"
+        msg["Subject"] = f"🔔 {report_meta.get('timestamp')} - {Path(report_meta.get('folder')).name} - Stock Picks"
         msg["From"] = formataddr(("Indian Stock Predictor", email_user))
         msg["To"] = email_to
         msg.set_content("This email contains HTML content. If you see this message, your email client may not support HTML.")
         msg.add_alternative(html_content, subtype="html")
 
-        # Attach CSV
-        with open(csv_path, "rb") as f:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(f.read())
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={Path(csv_path).name}")
-            msg.attach(part)
+        # Attach CSV (if present)
+        try:
+            with open(csv_path, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+                encoders.encode_base64(part)
+                part.add_header("Content-Disposition", f"attachment; filename={Path(csv_path).name}")
+                msg.attach(part)
+        except Exception as e:
+            logger.exception("Failed to attach CSV: %s", e)
 
         # Send via Gmail SMTP
         try:
-            # Gmail SSL
             with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
                 server.login(email_user, email_pass)
                 server.send_message(msg)
@@ -204,6 +288,7 @@ class ReportGenerator:
             logger.exception("Failed to send email: %s", e)
             if interactive:
                 print("Email sending failed. Check your app password and network.")
+
 
     def create_github_issue_if_ci(self, report_meta: dict, mode="daily"):
         """
