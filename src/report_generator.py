@@ -8,7 +8,7 @@ report_generator.py
 - CI-safe email sending:
   * If running in GitHub Actions and EMAIL_* secrets missing -> skip email (no interactive prompt)
   * Locally: will prompt interactively for Gmail + App Password if EMAIL_* env vars absent
-- Creates GitHub Issue in CI (assigns repo owner if available) with links to reports
+- Creates GitHub Issue in CI (assigns repo owner if available) with the generated Markdown as the issue body
 """
 from pathlib import Path
 from datetime import datetime
@@ -310,7 +310,7 @@ class ReportGenerator:
         except Exception:
             logger.exception("Failed to send email. If running in Actions, ensure EMAIL_USERNAME and EMAIL_PASSWORD are set as secrets.")
 
-        def create_github_issue_if_ci(self, report_meta: dict, mode: str = "daily"):
+    def create_github_issue_if_ci(self, report_meta: dict, mode: str = "daily"):
         """
         If running in GitHub Actions, create an issue using the generated Markdown report as the body.
         Uses GITHUB_TOKEN and GITHUB_REPOSITORY (both available in Actions).
