@@ -1,7 +1,8 @@
-name: All Predictions (matrix)
-
 # Run on schedule (example: daily at 09:00 IST -> 03:30 UTC)
 # and allow manual runs
+
+name: All Predictions (matrix)
+
 on:
   schedule:
     - cron: '30 3 * * 1-5'   # Mon-Fri 09:00 IST
