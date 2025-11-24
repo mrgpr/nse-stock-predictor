@@ -310,9 +310,9 @@ class ReportGenerator:
         except Exception:
             logger.exception("Failed to send email. If running in Actions, ensure EMAIL_USERNAME and EMAIL_PASSWORD are set as secrets.")
 
-    def create_github_issue_if_ci(self, report_meta: dict, mode: str = "daily"):
+        def create_github_issue_if_ci(self, report_meta: dict, mode: str = "daily"):
         """
-        If running in GitHub Actions, create an issue summarizing the top picks.
+        If running in GitHub Actions, create an issue using the generated Markdown report as the body.
         Uses GITHUB_TOKEN and GITHUB_REPOSITORY (both available in Actions).
         Assigns issue to GITHUB_REPOSITORY_OWNER if available to trigger notifications.
         """
@@ -327,36 +327,81 @@ class ReportGenerator:
             logger.warning("GITHUB_TOKEN or GITHUB_REPOSITORY missing; cannot create issue.")
             return
 
-        top = report_meta.get("top", [])[:10]
-        body_lines = [f"Automated **{mode}** picks for **{report_meta.get('timestamp')}**\n"]
-        for i, item in enumerate(top, start=1):
-            s = item.get("signals", {})
-            body_lines.append(
-                f"{i}. **{item.get('symbol')}** — Score: {item.get('score')} — {s.get('recommendation')} — Price: ₹{item.get('last_price')} — Target: {fmt_price(item.get('target')) if item.get('target') else 'N/A'}"
-            )
+        md_path = Path(report_meta.get("report_md", ""))
+        html_path = Path(report_meta.get("report_html", ""))
+        csv_path = Path(report_meta.get("report_csv", ""))
+        timestamp = report_meta.get("timestamp", "")
 
-        # If reports were created and committed to the repo, link to their blob path
-        folder = Path(report_meta.get("folder", ""))
-        if folder.exists():
-            base_url = f"{server}/{repo}/blob/HEAD/{folder.as_posix()}"
-            md_name = Path(report_meta.get("report_md")).name
-            csv_name = Path(report_meta.get("report_csv")).name
-            html_name = Path(report_meta.get("report_html")).name
-            body_lines.append("\n**Reports:**")
-            body_lines.append(f"- [Markdown report]({base_url}/{md_name})")
-            body_lines.append(f"- [HTML report]({base_url}/{html_name})")
-            body_lines.append(f"- [CSV export]({base_url}/{csv_name})")
-        else:
-            body_lines.append("\n(Report files are in the runner workspace and will be committed to the repo if configured.)")
+        # Read markdown report content (prefer the generated Markdown for the issue body)
+        body_md = ""
+        try:
+            if md_path.exists():
+                body_md = md_path.read_text(encoding="utf-8")
+            else:
+                # fallback: generate a short summary from report_meta['top']
+                top = report_meta.get("top", [])[:10]
+                lines = [f"Automated **{mode}** picks for **{timestamp}**\n"]
+                for i, item in enumerate(top, start=1):
+                    s = item.get("signals", {})
+                    lines.append(f"{i}. **{item.get('symbol')}** — Score: {item.get('score')} — {s.get('recommendation')} — Price: ₹{item.get('last_price')} — Target: {fmt_price(item.get('target')) if item.get('target') else 'N/A'}")
+                body_md = "\n".join(lines)
+        except Exception:
+            logger.exception("Failed to read markdown report; falling back to short summary.")
+            top = report_meta.get("top", [])[:10]
+            lines = [f"Automated **{mode}** picks for **{timestamp}**\n"]
+            for i, item in enumerate(top, start=1):
+                s = item.get("signals", {})
+                lines.append(f"{i}. **{item.get('symbol')}** — Score: {item.get('score')} — {s.get('recommendation')} — Price: ₹{item.get('last_price')} — Target: {fmt_price(item.get('target')) if item.get('target') else 'N/A'}")
+            body_md = "\n".join(lines)
 
-        body = "\n".join(body_lines)
+        # Prepend a small header/summary (counts)
+        try:
+            all_items = report_meta.get("all", [])
+            total = len(all_items)
+            counts = {
+                "STRONG BUY": sum(1 for it in all_items if (it.get("signals") or {}).get("recommendation") == "STRONG BUY"),
+                "BUY": sum(1 for it in all_items if (it.get("signals") or {}).get("recommendation") == "BUY"),
+                "HOLD": sum(1 for it in all_items if (it.get("signals") or {}).get("recommendation") == "HOLD"),
+                "SELL": sum(1 for it in all_items if (it.get("signals") or {}).get("recommendation") == "SELL"),
+            }
+            header = [f"Automated **{mode}** picks for **{timestamp}**", "", f"- Total scanned: {total}", f"- Strong Buy: {counts['STRONG BUY']}", f"- Buy: {counts['BUY']}", f"- Hold: {counts['HOLD']}", f"- Sell: {counts['SELL']}", ""]
+            full_body = "\n".join(header) + body_md
+        except Exception:
+            full_body = f"Automated **{mode}** picks for **{timestamp}**\n\n" + body_md
 
+        # Append links to reports in repo (if folder exists)
+        try:
+            folder = Path(report_meta.get("folder", ""))
+            if folder.exists():
+                base_url = f"{server}/{repo}/blob/HEAD/{folder.as_posix()}"
+                md_name = md_path.name if md_path.exists() else None
+                html_name = html_path.name if html_path.exists() else None
+                csv_name = csv_path.name if csv_path.exists() else None
+                link_lines = ["\n\n**Reports:**"]
+                if md_name:
+                    link_lines.append(f"- [Markdown report]({base_url}/{md_name})")
+                if html_name:
+                    link_lines.append(f"- [HTML report]({base_url}/{html_name})")
+                if csv_name:
+                    link_lines.append(f"- [CSV export]({base_url}/{csv_name})")
+                full_body += "\n".join(link_lines)
+            else:
+                full_body += "\n\n(Report files are in the runner workspace and will be committed to the repo if configured.)"
+        except Exception:
+            logger.exception("Failed to append report links to issue body.")
+
+        # Truncate if too long (safety)
+        MAX_LEN = 60000  # conservative
+        if len(full_body) > MAX_LEN:
+            full_body = full_body[:MAX_LEN - 200] + "\n\n*(report truncated)*\n"
+
+        # Assign to repo owner if possible
         owner = os.environ.get("GITHUB_REPOSITORY_OWNER")
         assignees = [owner] if owner else []
 
         payload = {
-            "title": f"[Auto] {mode.capitalize()} Picks - {report_meta.get('timestamp')}",
-            "body": body,
+            "title": f"[Auto] {mode.capitalize()} Picks - {timestamp}",
+            "body": full_body,
             "labels": ["automation", f"{mode}-report"],
             "assignees": assignees
         }
@@ -364,7 +409,7 @@ class ReportGenerator:
         url = f"https://api.github.com/repos/{repo}/issues"
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=20)
+            r = requests.post(url, headers=headers, json=payload, timeout=30)
             if r.status_code in (200, 201):
                 logger.info("GitHub issue created (%s).", r.json().get("html_url"))
             else:
