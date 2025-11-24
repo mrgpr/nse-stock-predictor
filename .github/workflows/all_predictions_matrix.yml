@@ -1,11 +1,8 @@
-# Run on schedule (example: daily at 09:00 IST -> 03:30 UTC)
-# and allow manual runs
-
 name: All Predictions (matrix)
 
 on:
   schedule:
-    - cron: '30 3 * * 1-5'   # Mon-Fri 09:00 IST
+    - cron: '30 3 * * 1-5'   # Mon-Fri 09:00 IST # Run on schedule (example: daily at 09:00 IST -> 03:30 UTC)  # and allow manual runs
   workflow_dispatch:
 
 permissions:
