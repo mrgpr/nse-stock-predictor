@@ -1,13 +1,18 @@
 """
 report_generator.py
-- Generates Markdown and HTML reports and CSV exports
-- Sends email via Gmail SMTP (interactive locally or using GitHub secrets in CI)
-- Creates GitHub Issue if running in GitHub Actions
-- Updated to assign created issues to repo owner when available (to trigger notifications)
+- Generates improved Markdown and HTML reports and CSV exports
+- Adds:
+  * Summary (counts, avg expected return)
+  * Grouped sections (STRONG BUY, BUY, HOLD, SELL)
+  * Target ranges, expected return %, volatility, sector, risk, short rationale
+- CI-safe email sending:
+  * If running in GitHub Actions and EMAIL_* secrets missing -> skip email (no interactive prompt)
+  * Locally: will prompt interactively for Gmail + App Password if EMAIL_* env vars absent
+- Creates GitHub Issue in CI (assigns repo owner if available) with links to reports
 """
-import logging
 from pathlib import Path
 from datetime import datetime
+import logging
 import csv
 import os
 import smtplib
@@ -15,12 +20,26 @@ from email.message import EmailMessage
 from email.mime.base import MIMEBase
 from email import encoders
 from email.utils import formataddr
-import json
-import sys
 import requests
+from typing import Dict, Any
 
 logger = logging.getLogger("report_generator")
 logger.setLevel(logging.INFO)
+
+# Helper formatters
+def fmt_price(p):
+    try:
+        return f"₹{p:,.2f}"
+    except Exception:
+        return "N/A"
+
+
+def fmt_pct(x):
+    try:
+        sign = "+" if x >= 0 else ""
+        return f"{sign}{x:.2f}%"
+    except Exception:
+        return "N/A"
 
 
 class ReportGenerator:
@@ -28,18 +47,18 @@ class ReportGenerator:
         self.root_reports = Path(root_reports)
         self.root_reports.mkdir(parents=True, exist_ok=True)
 
-    def _ensure_dir(self, mode, timestamp):
+    def _ensure_dir(self, mode: str, timestamp: str):
         folder = self.root_reports / mode / timestamp
         folder.mkdir(parents=True, exist_ok=True)
         return folder
 
-    def generate_report(self, scoring_results: dict, mode="daily", timestamp=None):
+    def generate_report(self, scoring_results: dict, mode: str = "daily", timestamp: str = None) -> dict:
         """
-        Creates:
-          - Markdown report
-          - HTML report
-          - CSV export
-        Returns paths and metadata
+        Create:
+          - Markdown report with summary and grouped sections
+          - HTML wrapper
+          - CSV export (flat)
+        Returns metadata dict with paths and lists.
         """
         timestamp = timestamp or datetime.utcnow().strftime("%Y-%m-%d")
         folder = self._ensure_dir(mode, timestamp)
@@ -47,80 +66,140 @@ class ReportGenerator:
         top = scoring_results.get("top", [])
         all_items = scoring_results.get("all", [])
 
-        # CSV
+        # CSV export (flat)
         csv_path = folder / f"{mode}_predictions_{timestamp}.csv"
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["rank", "symbol", "score", "last_price", "target", "stop_loss", "recommendation", "rsi", "macd_signal", "trend", "volume", "vol_avg_20", "bb_pos"])
-            for i, item in enumerate(top, start=1):
-                s = item["signals"]
+        try:
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
                 writer.writerow([
-                    i,
-                    item["symbol"],
-                    item["score"],
-                    item.get("last_price"),
-                    item.get("target"),
-                    item.get("stop_loss"),
-                    s.get("recommendation"),
-                    s.get("rsi"),
-                    s.get("macd_signal"),
-                    s.get("trend"),
-                    s.get("volume"),
-                    s.get("vol_avg_20"),
-                    s.get("bb_pos")
+                    "rank", "symbol", "score", "last_price", "target", "target_low", "target_high",
+                    "expected_return_pct", "volatility", "risk", "sector", "recommendation", "rationale"
                 ])
+                for i, item in enumerate(all_items, start=1):
+                    s = item.get("signals", {})
+                    writer.writerow([
+                        i,
+                        item.get("symbol"),
+                        item.get("score"),
+                        item.get("last_price"),
+                        item.get("target"),
+                        item.get("target_low"),
+                        item.get("target_high"),
+                        item.get("expected_return_pct"),
+                        item.get("volatility"),
+                        item.get("risk"),
+                        item.get("sector"),
+                        s.get("recommendation") if isinstance(s, dict) else None,
+                        item.get("rationale")
+                    ])
+        except Exception:
+            logger.exception("Failed to write CSV to %s", csv_path)
 
-        # Markdown
+        # Build grouped lists by recommendation
+        groups = {"STRONG BUY": [], "BUY": [], "HOLD": [], "SELL": []}
+        for item in all_items:
+            rec = item.get("signals", {}).get("recommendation", "HOLD")
+            if rec == "STRONG BUY":
+                groups["STRONG BUY"].append(item)
+            elif rec == "BUY":
+                groups["BUY"].append(item)
+            elif rec == "SELL":
+                groups["SELL"].append(item)
+            else:
+                groups["HOLD"].append(item)
+
+        # Summary lines
+        def avg_expected(items):
+            vals = [it.get("expected_return_pct") for it in items if it.get("expected_return_pct") is not None]
+            if not vals:
+                return None
+            return round(sum(vals) / len(vals), 2)
+
+        summary_lines = [
+            f"**Date:** {timestamp}",
+            f"- Strong Buy: {len(groups['STRONG BUY'])}",
+            f"- Buy: {len(groups['BUY'])}",
+            f"- Hold: {len(groups['HOLD'])}",
+            f"- Sell: {len(groups['SELL'])}"
+        ]
+        overall_avg = avg_expected(all_items)
+        if overall_avg is not None:
+            summary_lines.append(f"- Avg Expected Return: {fmt_pct(overall_avg)}")
+
+        # Markdown generation
         md_path = folder / f"{mode}_report_{timestamp}.md"
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(f"# 📈 {mode.capitalize()} Stock Predictions - {timestamp}\n\n")
-            f.write(f"## 🎯 Top {len(top)} Stocks\n\n")
-            for idx, item in enumerate(top, start=1):
-                s = item["signals"]
-                f.write(f"### 🥇 #{idx} - {item['symbol']}\n")
-                f.write(f"- **Current Price:** ₹{item.get('last_price')}\n")
-                # predicted return = (target/price -1)
-                ret = None
-                if item.get("last_price") and item.get("target"):
-                    try:
-                        ret = round((item["target"] / item["last_price"] - 1) * 100, 2)
-                    except Exception:
-                        ret = None
-                f.write(f"- **Predicted Return:** {('+'+str(ret)+'%') if ret is not None else 'N/A'}\n")
-                f.write(f"- **Confidence Score:** {item['score']}/100\n")
-                f.write(f"- **Signal:** {s.get('recommendation')} \n")
-                f.write(f"- **Target Price:** ₹{item.get('target')}\n")
-                f.write(f"- **Stop Loss:** ₹{item.get('stop_loss')}\n")
-                # Risk level heuristic
-                risk = "Low"
-                if item['score'] < 40:
-                    risk = "High"
-                elif item['score'] < 65:
-                    risk = "Medium"
-                f.write(f"- **Risk Level:** {risk}\n\n")
-                f.write(f"**Technical Indicators:**\n\n")
-                f.write(f"- RSI: {s.get('rsi')} ({s.get('rsi_signal')})\n")
-                f.write(f"- MACD: {s.get('macd_signal')}\n")
-                f.write(f"- Price: {'Above' if s.get('above_sma20') else 'Below'} 20-day & {'Above' if s.get('above_sma50') else 'Below'} 50-day MA\n")
-                vol_pct = ''
-                try:
-                    vol = s.get('volume') or 0
-                    vavg = s.get('vol_avg_20') or 0
-                    if vavg:
-                        vol_pct = f"{round((vol / vavg - 1) * 100, 1)}% above avg"
-                except Exception:
-                    vol_pct = ''
-                f.write(f"- Volume: {vol_pct}\n")
-                f.write(f"- Recommendation: Consider {'buying' if s.get('recommendation') in ('BUY', 'STRONG BUY') else 'avoiding'} based on technicals.\n\n")
+        try:
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(f"# 📈 {mode.capitalize()} Stock Predictions — {timestamp}\n\n")
+                f.write("## Summary\n")
+                for line in summary_lines:
+                    f.write(f"- {line}\n")
+                f.write("\n---\n\n")
 
-            # Market overview stub
-            f.write("## 📊 Market Overview\n")
-            f.write("- Nifty 50: (fetched from Yahoo) see report CSV for index values\n\n")
+                # Helper to write a table-like block
+                def write_section(title: str, items: list):
+                    f.write(f"## {title}\n\n")
+                    if not items:
+                        f.write("_No picks in this category_\n\n")
+                        return
+                    # Header
+                    f.write("| Stock | Price | Target (range) | Return | Risk | Sector | Notes |\n")
+                    f.write("|---|---:|---|---:|---|---|---|\n")
+                    for it in items:
+                        sym = it.get("symbol")
+                        price = it.get("last_price")
+                        tgt = it.get("target")
+                        t_low = it.get("target_low")
+                        t_high = it.get("target_high")
+                        exp = it.get("expected_return_pct")
+                        risk = it.get("risk")
+                        sector = it.get("sector")
+                        rationale = it.get("rationale") or ""
+                        price_s = fmt_price(price) if price is not None else "N/A"
+                        if t_low is not None and t_high is not None:
+                            tgt_s = f"{fmt_price(t_low)} – {fmt_price(t_high)}"
+                        elif tgt is not None:
+                            tgt_s = fmt_price(tgt)
+                        else:
+                            tgt_s = "N/A"
+                        exp_s = fmt_pct(exp) if exp is not None else "N/A"
+                        f.write(f"| **{sym}** | {price_s} | {tgt_s} | {exp_s} | {risk} | {sector} | {rationale} |\n")
+                    f.write("\n")
 
-        # HTML
+                # Order: Strong Buy, Buy, Hold, Sell
+                write_section("🔥 Strong Buy", groups["STRONG BUY"])
+                write_section("🟩 Buy", groups["BUY"])
+                write_section("🟨 Hold", groups["HOLD"])
+                write_section("🔴 Sell", groups["SELL"])
+
+                # Appendix with top details
+                f.write("---\n\n")
+                f.write("## 🧾 Detailed Top Picks (Top 20)\n\n")
+                for idx, it in enumerate(all_items[:20], start=1):
+                    f.write(f"### {idx}. {it.get('symbol')} — Score: {it.get('score')}\n")
+                    f.write(f"- **Price:** {fmt_price(it.get('last_price'))}\n")
+                    if it.get('target_low') is not None and it.get('target_high') is not None:
+                        f.write(f"- **Target Range:** {fmt_price(it.get('target_low'))} – {fmt_price(it.get('target_high'))}\n")
+                    elif it.get('target') is not None:
+                        f.write(f"- **Target:** {fmt_price(it.get('target'))}\n")
+                    f.write(f"- **Expected Return:** {fmt_pct(it.get('expected_return_pct'))}\n")
+                    f.write(f"- **Volatility (20d):** {it.get('volatility')}\n")
+                    f.write(f"- **Risk:** {it.get('risk')}\n")
+                    f.write(f"- **Sector:** {it.get('sector')}\n")
+                    f.write(f"- **Rationale:** {it.get('rationale')}\n\n")
+        except Exception:
+            logger.exception("Failed to write markdown report to %s", md_path)
+
+        # HTML wrapper (safe showing of markdown)
         html_path = folder / f"{mode}_report_{timestamp}.html"
-        with open(html_path, "w", encoding="utf-8") as f:
-            f.write(self._render_html(md_path.read_text(), title=f"{mode.capitalize()} Report {timestamp}"))
+        try:
+            with open(md_path, "r", encoding="utf-8") as fh:
+                md_text = fh.read()
+            html_content = self._render_html(md_text, title=f"{mode.capitalize()} Report {timestamp}")
+            with open(html_path, "w", encoding="utf-8") as fh:
+                fh.write(html_content)
+        except Exception:
+            logger.exception("Failed to write HTML report to %s", html_path)
 
         return {
             "report_md": str(md_path),
@@ -133,114 +212,58 @@ class ReportGenerator:
         }
 
     def _render_html(self, markdown_text: str, title: str = "Report") -> str:
-        # Very simple HTML wrapper and CSS to make the email pretty
         css = """
         body { font-family: Arial, Helvetica, sans-serif; padding: 20px; color: #111; }
         h1 { color: #0b5; }
-        pre { background: #f6f6f6; padding: 10px; border-radius: 6px; }
-        .stock { border: 1px solid #ddd; padding: 10px; margin-bottom: 10px; border-radius: 6px; }
-        .buy { color: green; }
-        .sell { color: red; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        tr:nth-child(even) { background-color: #f9f9f9; }
+        pre { white-space: pre-wrap; font-family: monospace; }
         """
         html = f"""<!doctype html>
 <html><head><meta charset="utf-8"/><title>{title}</title><style>{css}</style></head>
 <body><h1>{title}</h1><div><pre>{markdown_text}</pre></div></body></html>"""
         return html
 
-    # def send_email_with_report(self, report_meta: dict, top_n: int = 5):
-    #     """
-    #     Sends an HTML email with top N picks and attaches CSV.
-    #     If running in GitHub Actions, expects EMAIL_USERNAME, EMAIL_PASSWORD, EMAIL_TO in env (set as secrets).
-    #     Locally, prompts user for credentials interactively to avoid storing secrets.
-    #     """
-    #     # Read CSV and HTML
-    #     html_path = report_meta["report_html"]
-    #     csv_path = report_meta["report_csv"]
-
-    #     # Compose email content
-    #     with open(report_meta["report_md"], "r", encoding="utf-8") as f:
-    #         md = f.read()
-    #     html_content = self._render_html(md, title=f"Stock Picks {report_meta['timestamp']}")
-
-    #     # Acquire credentials
-    #     email_user = os.environ.get("EMAIL_USERNAME")
-    #     email_pass = os.environ.get("EMAIL_PASSWORD")
-    #     email_to = os.environ.get("EMAIL_TO")
-
-    #     interactive = False
-    #     if not (email_user and email_pass and email_to):
-    #         # Interactive prompt for local runs
-    #         interactive = True
-    #         print("Email credentials not found in environment. For local testing, enter Gmail credentials (App Password recommended).")
-    #         email_user = input("Gmail address (from): ").strip()
-    #         email_to = input("Recipient email (to): ").strip()
-    #         import getpass
-    #         email_pass = getpass.getpass("Gmail App Password (16 chars): ")
-
-    #     # Build email
-    #     msg = EmailMessage()
-    #     msg["Subject"] = f"🔔 {report_meta.get('timestamp')} - {report_meta.get('folder').split('/')[-1]} - Stock Picks"
-    #     msg["From"] = formataddr(("Indian Stock Predictor", email_user))
-    #     msg["To"] = email_to
-    #     msg.set_content("This email contains HTML content. If you see this message, your email client may not support HTML.")
-    #     msg.add_alternative(html_content, subtype="html")
-
-    #     # Attach CSV
-    #     with open(csv_path, "rb") as f:
-    #         part = MIMEBase("application", "octet-stream")
-    #         part.set_payload(f.read())
-    #         encoders.encode_base64(part)
-    #         part.add_header("Content-Disposition", f"attachment; filename={Path(csv_path).name}")
-    #         msg.attach(part)
-
-    #     # Send via Gmail SMTP
-    #     try:
-    #         # Gmail SSL
-    #         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
-    #             server.login(email_user, email_pass)
-    #             server.send_message(msg)
-    #             logger.info("Email sent to %s", email_to)
-    #     except Exception as e:
-    #         logger.exception("Failed to send email: %s", e)
-    #         if interactive:
-    #             print("Email sending failed. Check your app password and network.")
-
     def send_email_with_report(self, report_meta: dict, top_n: int = 5):
         """
-        Sends an HTML email with top N picks and attaches CSV.
+        Send HTML email with CSV attachment.
+
         Behavior:
-          - If running inside GitHub Actions and EMAIL_* env vars are NOT set, do NOT prompt (skip email).
-          - Locally (not in CI), prompt interactively if EMAIL_* are not set.
+          - If running in GitHub Actions and EMAIL_* env vars are missing, SKIP email and log an instruction.
+          - Locally, prompt interactively for credentials if EMAIL_* env vars are absent.
         """
-        # Read CSV and HTML
-        html_path = report_meta["report_html"]
-        csv_path = report_meta["report_csv"]
+        # Paths
+        md_path = Path(report_meta.get("report_md", ""))
+        html_path = Path(report_meta.get("report_html", ""))
+        csv_path = Path(report_meta.get("report_csv", ""))
 
-        # Compose email content
+        # compose HTML body from markdown for email (reuse renderer)
+        md_text = ""
         try:
-            with open(report_meta["report_md"], "r", encoding="utf-8") as f:
-                md = f.read()
-        except Exception as e:
-            logger.exception("Failed reading markdown report: %s", e)
-            md = ""
-        html_content = self._render_html(md, title=f"Stock Picks {report_meta.get('timestamp')}")
+            if md_path.exists():
+                md_text = md_path.read_text(encoding="utf-8")
+        except Exception:
+            logger.exception("Failed reading markdown for email body: %s", md_path)
 
-        # Acquire credentials from environment
+        html_body = self._render_html(md_text, title=f"Stock Picks {report_meta.get('timestamp')}")
+
+        # Get credentials from environment
         email_user = os.environ.get("EMAIL_USERNAME")
         email_pass = os.environ.get("EMAIL_PASSWORD")
         email_to = os.environ.get("EMAIL_TO")
 
         running_ci = os.environ.get("GITHUB_ACTIONS") == "true"
 
-        # If in CI and credentials missing, do not prompt: log and return gracefully
+        # CI behavior: do not prompt if missing — just skip email
         if running_ci and not (email_user and email_pass and email_to):
             logger.info(
-                "Running in CI and email credentials not found. Skipping email send. "
+                "Running in CI and EMAIL_* secrets not set. Skipping email send. "
                 "To enable emails from Actions, set repository secrets: EMAIL_USERNAME, EMAIL_PASSWORD, EMAIL_TO."
             )
             return
 
-        # If not in CI and credentials missing, prompt interactively
+        # Local interactive behavior: prompt if missing
         interactive = False
         if not (email_user and email_pass and email_to):
             interactive = True
@@ -250,51 +273,48 @@ class ReportGenerator:
                 email_to = input("Recipient email (to): ").strip()
                 import getpass
                 email_pass = getpass.getpass("Gmail App Password (16 chars): ")
-            except Exception as e:
-                logger.exception("Interactive prompt failed or not available: %s", e)
-                # Do not raise in non-interactive environments
+            except Exception:
+                logger.exception("Interactive prompt failed or not available; skipping email.")
                 return
 
         if not (email_user and email_pass and email_to):
             logger.warning("Email credentials incomplete; skipping email.")
             return
 
-        # Build email
+        # Build message
         msg = EmailMessage()
         msg["Subject"] = f"🔔 {report_meta.get('timestamp')} - {Path(report_meta.get('folder')).name} - Stock Picks"
         msg["From"] = formataddr(("Indian Stock Predictor", email_user))
         msg["To"] = email_to
-        msg.set_content("This email contains HTML content. If you see this message, your email client may not support HTML.")
-        msg.add_alternative(html_content, subtype="html")
+        msg.set_content("This email contains HTML content. If you see this message, your client may not support HTML.")
+        msg.add_alternative(html_body, subtype="html")
 
-        # Attach CSV (if present)
+        # Attach CSV if exists
         try:
-            with open(csv_path, "rb") as f:
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(f.read())
-                encoders.encode_base64(part)
-                part.add_header("Content-Disposition", f"attachment; filename={Path(csv_path).name}")
-                msg.attach(part)
-        except Exception as e:
-            logger.exception("Failed to attach CSV: %s", e)
+            if csv_path.exists():
+                with open(csv_path, "rb") as f:
+                    part = MIMEBase("application", "octet-stream")
+                    part.set_payload(f.read())
+                    encoders.encode_base64(part)
+                    part.add_header("Content-Disposition", f"attachment; filename={csv_path.name}")
+                    msg.attach(part)
+        except Exception:
+            logger.exception("Failed attaching CSV: %s", csv_path)
 
-        # Send via Gmail SMTP
+        # Send using Gmail SMTP SSL
         try:
             with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
                 server.login(email_user, email_pass)
                 server.send_message(msg)
                 logger.info("Email sent to %s", email_to)
-        except Exception as e:
-            logger.exception("Failed to send email: %s", e)
-            if interactive:
-                print("Email sending failed. Check your app password and network.")
+        except Exception:
+            logger.exception("Failed to send email. If running in Actions, ensure EMAIL_USERNAME and EMAIL_PASSWORD are set as secrets.")
 
-
-    def create_github_issue_if_ci(self, report_meta: dict, mode="daily"):
+    def create_github_issue_if_ci(self, report_meta: dict, mode: str = "daily"):
         """
-        If running inside GitHub Actions, create an issue summarizing the top picks.
-        Uses GITHUB_TOKEN and github context env variables in actions.
-        Assigns the issue to the repository owner (GITHUB_REPOSITORY_OWNER) if available to trigger notifications.
+        If running in GitHub Actions, create an issue summarizing the top picks.
+        Uses GITHUB_TOKEN and GITHUB_REPOSITORY (both available in Actions).
+        Assigns issue to GITHUB_REPOSITORY_OWNER if available to trigger notifications.
         """
         if os.environ.get("GITHUB_ACTIONS") != "true":
             logger.debug("Not running in GitHub Actions; skipping issue creation.")
@@ -307,19 +327,17 @@ class ReportGenerator:
             logger.warning("GITHUB_TOKEN or GITHUB_REPOSITORY missing; cannot create issue.")
             return
 
-        # Build top picks summary
         top = report_meta.get("top", [])[:10]
         body_lines = [f"Automated **{mode}** picks for **{report_meta.get('timestamp')}**\n"]
         for i, item in enumerate(top, start=1):
-            s = item["signals"]
-            line = f"{i}. **{item['symbol']}** — Score: {item['score']} — {s.get('recommendation')} — Price: ₹{item.get('last_price')} — Target: ₹{item.get('target')}"
-            body_lines.append(line)
+            s = item.get("signals", {})
+            body_lines.append(
+                f"{i}. **{item.get('symbol')}** — Score: {item.get('score')} — {s.get('recommendation')} — Price: ₹{item.get('last_price')} — Target: {fmt_price(item.get('target')) if item.get('target') else 'N/A'}"
+            )
 
-        # Link to report files within the repository if they exist in the workspace
+        # If reports were created and committed to the repo, link to their blob path
         folder = Path(report_meta.get("folder", ""))
         if folder.exists():
-            # Compute a repo URL to the files assuming reports are committed to the default branch after workflow
-            # This uses GITHUB_SERVER_URL and GITHUB_REPOSITORY to point at the path
             base_url = f"{server}/{repo}/blob/HEAD/{folder.as_posix()}"
             md_name = Path(report_meta.get("report_md")).name
             csv_name = Path(report_meta.get("report_csv")).name
@@ -329,11 +347,10 @@ class ReportGenerator:
             body_lines.append(f"- [HTML report]({base_url}/{html_name})")
             body_lines.append(f"- [CSV export]({base_url}/{csv_name})")
         else:
-            body_lines.append("\n(Report files are saved in the Action runner workspace. They will be committed to the repo if configured.)")
+            body_lines.append("\n(Report files are in the runner workspace and will be committed to the repo if configured.)")
 
         body = "\n".join(body_lines)
 
-        # Try to assign to repo owner to get explicit notification
         owner = os.environ.get("GITHUB_REPOSITORY_OWNER")
         assignees = [owner] if owner else []
 
@@ -352,5 +369,5 @@ class ReportGenerator:
                 logger.info("GitHub issue created (%s).", r.json().get("html_url"))
             else:
                 logger.warning("GitHub issue creation failed: %s %s", r.status_code, r.text)
-        except Exception as e:
-            logger.exception("Error creating GitHub issue: %s", e)
+        except Exception:
+            logger.exception("Error creating GitHub issue")
