@@ -205,7 +205,7 @@ class ReportGenerator:
     #         if interactive:
     #             print("Email sending failed. Check your app password and network.")
 
-        def send_email_with_report(self, report_meta: dict, top_n: int = 5):
+    def send_email_with_report(self, report_meta: dict, top_n: int = 5):
         """
         Sends an HTML email with top N picks and attaches CSV.
         Behavior:
