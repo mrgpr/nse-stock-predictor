@@ -1,0 +1,46 @@
+name: Daily Prediction
+
+on:
+  schedule:
+    # Runs Monday-Friday at 9:00 AM IST => 03:30 UTC
+    - cron: '30 3 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  run-daily:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run daily prediction
+        env:
+          # These must be added in repo Settings -> Secrets
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python main.py --mode daily
+
+      - name: Commit reports back to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports || true
+          git commit -m "Auto: daily reports $(date -u +"%Y-%m-%d")" || echo "No changes to commit"
+          git push origin HEAD:$(git rev-parse --abbrev-ref HEAD)

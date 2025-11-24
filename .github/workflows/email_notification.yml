@@ -1,0 +1,51 @@
+name: Email Notification (Manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  send-email:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Send latest report via email
+        env:
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          # This simple helper finds the latest report and sends email via ReportGenerator
+          python - <<'PY'
+from pathlib import Path
+from src.report_generator import ReportGenerator
+r = ReportGenerator(Path("reports"))
+# Find latest mode folder with content
+modes = ["daily","weekly","monthly"]
+import os, glob
+for mode in modes:
+    base = Path("reports") / mode
+    if base.exists():
+        subdirs = sorted([p for p in base.iterdir() if p.is_dir()])
+        if subdirs:
+            latest = subdirs[-1]
+            # assume report_md exists
+            fp = latest / list(latest.glob("*.md"))[0]
+            # build minimal meta
+            meta = {"report_md": str(fp), "report_html": str(latest / list(latest.glob('*.html'))[0]), "report_csv": str(latest / list(latest.glob('*.csv'))[0]), "timestamp": latest.name, "folder": str(latest)}
+            r.send_email_with_report(meta, top_n=5)
+            print("Email attempted for", latest)
+            break
+PY

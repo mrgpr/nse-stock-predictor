@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / generated files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Data & reports
+/data/
+reports/
+*.sqlite3
+
+# Virtualenv
+venv/
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# GitHub Actions artifacts
+.github/workflows/*.log
+
+# Notebook checkpoints
+.ipynb_checkpoints
+
+# Python packaging
+build/
+dist/
+*.egg-info/
