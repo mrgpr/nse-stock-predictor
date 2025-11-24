@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Main CLI to run predictions.
-Modes: daily, weekly, monthly
+Modes: daily, weekly, monthly, quarterly, biquarterly, yearly
 This script orchestrates data fetch -> TA -> scoring -> report -> email (optional)
-It now prints a nicely formatted console summary grouped by recommendation.
+It selects historical periods appropriate to each mode so the screener's volatility windows and targets are meaningful.
 """
 import argparse
 import logging
@@ -26,7 +26,7 @@ logger = logging.getLogger("main")
 
 ROOT = Path(__file__).parent
 
-# Local formatting helpers
+# Formatting helpers
 def fmt_price(p):
     try:
         return f"₹{float(p):,.2f}"
@@ -43,9 +43,6 @@ def fmt_pct(x):
 def print_console_report(report_meta):
     """
     Nicely print the report to console using report_meta produced by ReportGenerator.
-    Expects report_meta['all'] to contain items with fields:
-      symbol, last_price, target, target_low, target_high, expected_return_pct, risk, sector, rationale, signals.recommendation
-    Group by recommendation and print top lines.
     """
     all_items = report_meta.get("all", [])
     if not all_items:
@@ -118,45 +115,81 @@ def print_console_report(report_meta):
     print_section("🟨 Hold", groups["HOLD"])
     print_section("🔴 Sell", groups["SELL"])
 
-def run(mode: str):
-    logger.info("Starting Indian Stock Predictor - mode=%s", mode)
-    # load symbols
-    config_path = ROOT / "config" / "stocks_list.json"
 
+def run(mode: str):
+    mode = mode.lower()
+    allowed_modes = ["daily", "weekly", "monthly", "quarterly", "biquarterly", "yearly"]
+    if mode not in allowed_modes:
+        logger.error("Invalid mode '%s'. Allowed: %s", mode, ", ".join(allowed_modes))
+        return
+
+    logger.info("Starting Indian Stock Predictor - mode=%s", mode)
+
+    # Choose history lengths (period strings understood by yfinance)
+    # We'll pick conservative choices:
+    # - daily/weekly: 1 year of daily data
+    # - monthly/quarterly: 3 years (gives enough history for 60/120-day windows)
+    # - biquarterly/yearly: 5 years
+    period_map = {
+        "daily": "1y",
+        "weekly": "1y",
+        "monthly": "3y",
+        "quarterly": "3y",
+        "biquarterly": "5y",
+        "yearly": "5y"
+    }
+    interval_map = {
+        # Keep daily granularity; weekly/monthly analysis still benefits from daily history
+        "daily": "1d",
+        "weekly": "1d",
+        "monthly": "1d",
+        "quarterly": "1d",
+        "biquarterly": "1d",
+        "yearly": "1d"
+    }
+
+    period = period_map.get(mode, "1y")
+    interval = interval_map.get(mode, "1d")
+
+    # Initialize components
+    config_path = ROOT / "config" / "stocks_list.json"
     fetcher = DataFetcher(config_path=config_path, historical_path=ROOT / "data" / "historical")
     analyzer = TechnicalAnalyzer()
     screener = StockScreener(config_path=config_path)
     reports = ReportGenerator(root_reports=ROOT / "reports")
 
-    # Determine stocks to analyze
     symbols = fetcher.list_all_symbols()
     logger.info("Symbols count: %d", len(symbols))
 
-    # Fetch data (batch)
-    hist_data = fetcher.fetch_batch(symbols, period="1y", interval="1d")  # 1 year daily
+    # Fetch historical data appropriate for the mode
+    logger.info("Downloading history for period=%s interval=%s", period, interval)
+    hist_data = fetcher.fetch_batch(symbols, period=period, interval=interval)
     logger.info("Downloaded historical data for %d symbols", len(hist_data))
 
     # Compute indicators and signals
     ta_results = {}
     for sym, df in hist_data.items():
         try:
+            if df is None or df.empty:
+                logger.warning("Empty data for %s, skipping TA", sym)
+                continue
             ta_df = analyzer.add_indicators(df.copy())
             signals = analyzer.generate_signals(ta_df)
             ta_results[sym] = {"df": ta_df, "signals": signals}
         except Exception as e:
             logger.exception("Failed to compute TA for %s: %s", sym, e)
 
-    # Score & rank
+    # Score & rank (screener uses mode to pick volatility window)
     scoring_results = screener.score_universe(ta_results, mode=mode)
 
-    # Generate report
+    # Generate report (timestamped)
     timestamp = datetime.utcnow().strftime("%Y-%m-%d")
     report_meta = reports.generate_report(scoring_results, mode=mode, timestamp=timestamp)
 
     logger.info("Report generated: %s", report_meta["report_md"])
     logger.info("CSV saved: %s", report_meta["report_csv"])
 
-    # Print a nicely formatted console summary (immediately visible)
+    # Print console summary for immediate visibility
     try:
         print_console_report(report_meta)
     except Exception:
@@ -169,13 +202,14 @@ def run(mode: str):
     except Exception as e:
         logger.exception("Email sending failed: %s", e)
 
-    # Create GitHub issue if GITHUB_ACTIONS is available
+    # Create GitHub issue in CI if applicable (report body uses markdown)
     reports.create_github_issue_if_ci(report_meta, mode=mode)
 
     logger.info("Done.")
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Indian Stock Predictor - run daily/weekly/monthly scans")
-    parser.add_argument("--mode", choices=["daily", "weekly", "monthly"], default="daily", help="Mode to run")
+    parser = argparse.ArgumentParser(description="Indian Stock Predictor - run scans")
+    parser.add_argument("--mode", choices=["daily", "weekly", "monthly", "quarterly", "biquarterly", "yearly"], default="daily", help="Mode to run")
     args = parser.parse_args()
     run(args.mode)

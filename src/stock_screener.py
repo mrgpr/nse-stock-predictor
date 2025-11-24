@@ -1,8 +1,18 @@
 """
 stock_screener.py
-- Scoring as before with ATR-based volatility
-- Computes target range using ATR fraction
-- Adds sector, risk, rationale, expected_return_pct
+- Scoring stocks 0-100 using the existing weighted heuristic
+- Adds timeframe-aware volatility lookbacks:
+    daily -> 20
+    weekly -> 40
+    monthly -> 60
+    quarterly -> 120 (3 months x 20? see note)
+    biquarterly -> 120 (6 months -> 120)  # we'll use 120 for 6 months
+    yearly -> 240
+- Volatility computed as the conservative max of:
+    * ATR(14) / price  (short-term true range)
+    * rolling std of returns over the timeframe window
+- Targets and target ranges sized using the volatility measure appropriate to the mode.
+- Returns sector, risk, rationale, expected_return_pct, target_low/high
 """
 import logging
 from typing import Dict, Any
@@ -16,8 +26,19 @@ logger = logging.getLogger("stock_screener")
 logger.setLevel(logging.INFO)
 
 
+# Default mapping (trading days)
+DEFAULT_VOL_WINDOW = {
+    "daily": 20,         # ~1 month
+    "weekly": 40,        # ~2 months
+    "monthly": 60,       # ~3 months
+    "quarterly": 60,     # quarter (3 months). use 60 to align with monthly medium-term.
+    "biquarterly": 120,  # 6 months -> 120 trading days approx
+    "yearly": 240        # ~1 year trading days (approx)
+}
+
+
 class StockScreener:
-    def __init__(self, config_path: Path = Path("config") / "stocks_list.json"):
+    def __init__(self, config_path: Path = Path("config") / "stocks_list.json", vol_window_map: Dict[str, int] = None):
         self.weights = {
             "rsi": 20,
             "macd": 20,
@@ -28,6 +49,7 @@ class StockScreener:
         }
         self.config_path = Path(config_path)
         self.sectors = {}
+        self.vol_window_map = vol_window_map or DEFAULT_VOL_WINDOW
         self._load_config()
 
     def _load_config(self):
@@ -41,16 +63,16 @@ class StockScreener:
 
     def _compute_atr_pct(self, df: pd.DataFrame):
         """
-        ATR(14) / current price — a volatility proxy
+        ATR(14)/price as short-term volatility proxy.
         """
         try:
             if df is None or df.empty or not {"High", "Low", "Close"}.issubset(df.columns):
                 return 0.0
             atr = AverageTrueRange(high=df["High"], low=df["Low"], close=df["Close"], window=14)
-            atr_val = atr.average_true_range()
-            if atr_val is None or atr_val.empty:
+            atr_series = atr.average_true_range()
+            if atr_series is None or atr_series.empty:
                 return 0.0
-            atr_latest = float(atr_val.iloc[-1])
+            atr_latest = float(atr_series.iloc[-1])
             price = float(df["Close"].iloc[-1])
             if price <= 0:
                 return 0.0
@@ -58,6 +80,40 @@ class StockScreener:
         except Exception:
             logger.exception("ATR computation failed")
             return 0.0
+
+    def _compute_return_std(self, df: pd.DataFrame, window: int):
+        """
+        Rolling std of daily returns over `window` days. Fallback safe returns.
+        """
+        try:
+            if df is None or df.empty or "Close" not in df.columns:
+                return 0.0
+            returns = df["Close"].pct_change().dropna()
+            if returns.empty:
+                return 0.0
+            if window < 2:
+                window = 2
+            val = returns.rolling(window=window, min_periods=5).std().iloc[-1]
+            if pd.isna(val):
+                val = returns.std()
+            return float(val) if not pd.isna(val) else 0.0
+        except Exception:
+            logger.exception("Return std computation failed")
+            return 0.0
+
+    def _volatility_for_mode(self, df: pd.DataFrame, mode: str):
+        """
+        Determine volatility based on mode's window:
+         - compute ATR_pct (short-term)
+         - compute returns std over vol_window
+         - return the conservative max(atr_pct, ret_std)
+        """
+        vol_window = int(self.vol_window_map.get(mode, DEFAULT_VOL_WINDOW.get(mode, 20)))
+        atr_pct = self._compute_atr_pct(df)
+        ret_std = self._compute_return_std(df, vol_window)
+        # Conservative: pick the larger (more risk-aware)
+        vol = max(atr_pct, ret_std)
+        return vol, atr_pct, ret_std, vol_window
 
     def _rationale_from_signals(self, signals: Dict[str, Any]):
         parts = []
@@ -77,24 +133,34 @@ class StockScreener:
             return "No strong technical signals"
         return "; ".join(parts[:2])
 
-    def _risk_rating(self, score: float, atr_pct: float):
+    def _risk_rating(self, score: float, vol: float):
+        """
+        Tuned thresholds — adjust as needed per your distribution.
+        vol expected as a decimal (e.g., 0.03 ~ 3%)
+        """
         try:
-            if score < 40 or atr_pct > 0.08:
+            if score < 40 or vol > 0.08:
                 return "High"
-            if atr_pct > 0.04 or score < 65:
+            if vol > 0.04 or score < 65:
                 return "Medium"
             return "Low"
         except Exception:
             return "Unknown"
 
     def score_universe(self, ta_results: Dict[str, Dict[str, Any]], mode: str = "daily"):
+        """
+        ta_results: { symbol: {"df": df, "signals": signals} }
+        mode: one of daily/weekly/monthly/quarterly/biquarterly/yearly
+        Returns dict {all: [...], top: [...]}
+        """
         scored = {}
+        mode = mode.lower()
         for sym, info in ta_results.items():
             signals = info.get("signals", {}) or {}
             df = info.get("df")
             score = 0.0
 
-            # RSI
+            # RSI scoring
             rsi = signals.get("rsi", 50)
             if rsi < 30:
                 score += 1.0 * self.weights["rsi"]
@@ -165,8 +231,8 @@ class StockScreener:
             except Exception:
                 last_price = None
 
-            # ATR-based volatility
-            atr_pct = self._compute_atr_pct(df)
+            # Volatility selection depending on mode
+            vol, atr_pct, ret_std, vol_window = self._volatility_for_mode(df, mode)
 
             # Basic target (resistance or +5%)
             resistance = signals.get("resistance_20")
@@ -183,14 +249,14 @@ class StockScreener:
             target_high = None
             expected_return_pct = None
             if target is not None and last_price is not None:
-                # target range: +/- atr_pct * multiplier (use 1.0 by default)
+                # Range: +/- vol * multiplier
                 mult = 1.0
-                atr_used = max(atr_pct, 0.01)
-                target_low = float(target * (1 - atr_used * mult))
-                target_high = float(target * (1 + atr_used * mult))
+                vol_used = max(vol, 0.01)  # floor to 1%
+                target_low = float(target * (1 - vol_used * mult))
+                target_high = float(target * (1 + vol_used * mult))
                 expected_return_pct = float((target / last_price - 1) * 100)
 
-            risk = self._risk_rating(final_score, atr_pct)
+            risk = self._risk_rating(final_score, vol)
             sector = self.sectors.get(sym, "Unknown")
             rationale = self._rationale_from_signals(signals)
 
@@ -203,12 +269,16 @@ class StockScreener:
                 "target_low": target_low,
                 "target_high": target_high,
                 "expected_return_pct": None if expected_return_pct is None else round(expected_return_pct, 2),
-                "volatility": round(float(atr_pct), 4),
+                "volatility": round(float(vol), 4),
+                "atr_pct": round(float(atr_pct), 4),
+                "ret_std": round(float(ret_std), 4),
+                "vol_window": vol_window,
                 "risk": risk,
                 "sector": sector,
                 "rationale": rationale
             }
 
+        # Sort & pick top
         items = sorted(scored.values(), key=lambda x: x["score"], reverse=True)
-        top_n = {"daily": 5, "weekly": 10, "monthly": 20}.get(mode, 5)
+        top_n = {"daily": 5, "weekly": 10, "monthly": 20, "quarterly": 20, "biquarterly": 30, "yearly": 50}.get(mode, 5)
         return {"all": items, "top": items[:top_n]}

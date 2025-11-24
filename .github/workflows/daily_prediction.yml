@@ -2,25 +2,26 @@ name: Daily Prediction
 
 on:
   schedule:
-    # Runs Monday-Friday at 9:00 AM IST => 03:30 UTC
-    - cron: '30 3 * * 1-5'
+    - cron: '30 3 * * 1-5'  # Mon-Fri 09:00 IST = 03:30 UTC
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  actions: write
   issues: write
 
 jobs:
   run-daily:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Install dependencies
         run: |
@@ -28,17 +29,10 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run daily prediction
-        env:
-          # These must be added in repo Settings -> Secrets
-          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python main.py --mode daily
+        run: python main.py --mode daily
 
       - name: Upload reports artifact
         uses: actions/upload-artifact@v4
         with:
-          name: reports-${{ github.run_id }}
+          name: reports-daily-${{ github.run_id }}
           path: reports/
