@@ -1,29 +1,23 @@
 """
 stock_screener.py
-- Scores stocks 0-100 using described weights
-- Adds:
-  * volatility (20-day std of returns)
-  * target_range_low / high based on volatility
-  * expected_return_pct
-  * sector (from config)
-  * risk rating (Low/Medium/High)
-  * short rationale 1-2 lines
-- Filters top N for each mode
+- Scoring as before with ATR-based volatility
+- Computes target range using ATR fraction
+- Adds sector, risk, rationale, expected_return_pct
 """
 import logging
 from typing import Dict, Any
 from pathlib import Path
 import json
 import numpy as np
-import math
 import pandas as pd
+from ta.volatility import AverageTrueRange
 
 logger = logging.getLogger("stock_screener")
+logger.setLevel(logging.INFO)
 
 
 class StockScreener:
     def __init__(self, config_path: Path = Path("config") / "stocks_list.json"):
-        # Weights (sum 100)
         self.weights = {
             "rsi": 20,
             "macd": 20,
@@ -45,185 +39,159 @@ class StockScreener:
             logger.warning("Failed to load sectors from config: %s", e)
             self.sectors = {}
 
-    def _format_price(self, p):
-        try:
-            return float(p) if p is not None else None
-        except Exception:
-            return None
-
-    def _compute_volatility(self, df: pd.DataFrame):
+    def _compute_atr_pct(self, df: pd.DataFrame):
         """
-        Compute recent volatility as 20-day std dev of daily returns.
+        ATR(14) / current price — a volatility proxy
         """
         try:
-            if df is None or df.empty or "Close" not in df.columns:
+            if df is None or df.empty or not {"High", "Low", "Close"}.issubset(df.columns):
                 return 0.0
-            returns = df["Close"].pct_change().dropna()
-            vol20 = returns.rolling(window=20, min_periods=5).std().iloc[-1] if not returns.empty else 0.0
-            # fallback
-            if vol20 is None or np.isnan(vol20):
-                vol20 = returns.std() if not returns.empty else 0.0
-            return float(vol20) if vol20 is not None else 0.0
-        except Exception as e:
-            logger.exception("Volatility computation failed: %s", e)
+            atr = AverageTrueRange(high=df["High"], low=df["Low"], close=df["Close"], window=14)
+            atr_val = atr.average_true_range()
+            if atr_val is None or atr_val.empty:
+                return 0.0
+            atr_latest = float(atr_val.iloc[-1])
+            price = float(df["Close"].iloc[-1])
+            if price <= 0:
+                return 0.0
+            return max(0.0, atr_latest / price)
+        except Exception:
+            logger.exception("ATR computation failed")
             return 0.0
 
-    def _risk_rating(self, score: float, volatility: float):
-        """
-        Simple risk heuristic:
-         - High: score < 40 or volatility > 0.06
-         - Medium: volatility between 0.03 and 0.06 or score < 65
-         - Low: otherwise
-        """
-        try:
-            if score < 40 or volatility > 0.06:
-                return "High"
-            if volatility > 0.03 or score < 65:
-                return "Medium"
-            return "Low"
-        except Exception:
-            return "Unknown"
-
     def _rationale_from_signals(self, signals: Dict[str, Any]):
-        """
-        Build 1-2 line rationale from signals:
-        - mention MACD, RSI, trend, volume
-        """
         parts = []
         macd = signals.get("macd_signal")
         rsi_sig = signals.get("rsi_signal")
         trend = signals.get("trend")
         vol_surge = signals.get("volume_surge")
-
-        if macd in ("bullish_crossover",):
+        if macd == "bullish_crossover":
             parts.append("MACD bullish crossover")
-        elif macd in ("bearish_crossover",):
-            parts.append("MACD bearish crossover")
-
         if rsi_sig in ("oversold", "strong"):
             parts.append(f"RSI {rsi_sig}")
-
         if trend and trend != "unknown":
             parts.append(f"Trend: {trend}")
-
         if vol_surge:
             parts.append("Volume surge")
-
-        # limit to 2 short phrases
         if not parts:
             return "No strong technical signals"
         return "; ".join(parts[:2])
 
-    def score_universe(self, ta_results: Dict[str, Dict[str, Any]], mode="daily"):
-        """
-        ta_results: { symbol: {"df": df, "signals": signals} }
-        Returns a dict with symbol -> scoring metadata including sector, target range, expected return, risk, rationale
-        """
+    def _risk_rating(self, score: float, atr_pct: float):
+        try:
+            if score < 40 or atr_pct > 0.08:
+                return "High"
+            if atr_pct > 0.04 or score < 65:
+                return "Medium"
+            return "Low"
+        except Exception:
+            return "Unknown"
+
+    def score_universe(self, ta_results: Dict[str, Dict[str, Any]], mode: str = "daily"):
         scored = {}
         for sym, info in ta_results.items():
             signals = info.get("signals", {}) or {}
             df = info.get("df")
             score = 0.0
 
-            # RSI scoring
-            rsi = signals.get("rsi", None) or 50.0
+            # RSI
+            rsi = signals.get("rsi", 50)
             if rsi < 30:
-                rsi_score = 1.0
+                score += 1.0 * self.weights["rsi"]
             elif rsi < 45:
-                rsi_score = 0.8
+                score += 0.8 * self.weights["rsi"]
             elif rsi < 55:
-                rsi_score = 0.6
+                score += 0.6 * self.weights["rsi"]
             elif rsi < 70:
-                rsi_score = 0.3
+                score += 0.3 * self.weights["rsi"]
             else:
-                rsi_score = 0.1
-            score += rsi_score * self.weights["rsi"]
+                score += 0.1 * self.weights["rsi"]
 
-            # MACD crossover
+            # MACD
             macd_sig = signals.get("macd_signal", "neutral")
-            macd_score = 1.0 if macd_sig == "bullish_crossover" else (0.0 if macd_sig == "bearish_crossover" else 0.4)
-            score += macd_score * self.weights["macd"]
+            if macd_sig == "bullish_crossover":
+                score += 1.0 * self.weights["macd"]
+            elif macd_sig == "bearish_crossover":
+                score += 0.0 * self.weights["macd"]
+            else:
+                score += 0.4 * self.weights["macd"]
 
             # MA trend
             trend = signals.get("trend", "unknown")
-            ma_score = 1.0 if trend == "up" else (0.0 if trend == "down" else 0.4)
-            score += ma_score * self.weights["ma_trend"]
+            if trend == "up":
+                score += 1.0 * self.weights["ma_trend"]
+            elif trend == "down":
+                score += 0.0 * self.weights["ma_trend"]
+            else:
+                score += 0.4 * self.weights["ma_trend"]
 
             # Volume surge
-            vol_score = 1.0 if signals.get("volume_surge") else 0.3
-            score += vol_score * self.weights["volume"]
+            score += (1.0 if signals.get("volume_surge") else 0.3) * self.weights["volume"]
 
-            # Momentum
+            # Momentum using mom_5/mom_20 if available
             mom5 = df["mom_5"].iloc[-1] if (df is not None and "mom_5" in df.columns and len(df) > 0) else 0.0
             mom20 = df["mom_20"].iloc[-1] if (df is not None and "mom_20" in df.columns and len(df) > 0) else 0.0
             mom = np.nanmean([mom5, mom20])
             if np.isnan(mom):
                 mom = 0.0
             if mom > 0.05:
-                mom_score = 1.0
+                score += 1.0 * self.weights["momentum"]
             elif mom > 0.01:
-                mom_score = 0.7
+                score += 0.7 * self.weights["momentum"]
             elif mom > -0.01:
-                mom_score = 0.4
+                score += 0.4 * self.weights["momentum"]
             else:
-                mom_score = 0.1
-            score += mom_score * self.weights["momentum"]
+                score += 0.1 * self.weights["momentum"]
 
-            # Bollinger
+            # Bollinger position
             bbpos = signals.get("bb_pos", 0.5) or 0.5
             if bbpos < 0.2:
-                bb_score = 1.0
+                score += 1.0 * self.weights["bollinger"]
             elif bbpos < 0.4:
-                bb_score = 0.8
+                score += 0.8 * self.weights["bollinger"]
             elif bbpos < 0.6:
-                bb_score = 0.5
+                score += 0.5 * self.weights["bollinger"]
             elif bbpos < 0.8:
-                bb_score = 0.2
+                score += 0.2 * self.weights["bollinger"]
             else:
-                bb_score = 0.0
-            score += bb_score * self.weights["bollinger"]
+                score += 0.0 * self.weights["bollinger"]
 
             final_score = max(0.0, min(100.0, score))
 
-            # Price & target
+            # Last price
             last_price = None
             try:
                 last_price = float(signals.get("price") if signals.get("price") is not None else (df["Close"].iloc[-1] if (df is not None and "Close" in df.columns and len(df) > 0) else None))
             except Exception:
                 last_price = None
 
-            # compute volatility (20-day)
-            volatility = self._compute_volatility(df)
+            # ATR-based volatility
+            atr_pct = self._compute_atr_pct(df)
 
-            # baseline target (same logic as before)
-            support = signals.get("support_20")
+            # Basic target (resistance or +5%)
             resistance = signals.get("resistance_20")
-            target = None
             if last_price is not None:
                 if resistance and resistance > last_price:
-                    target = float(resistance * 1.03)
+                    base_target = float(resistance * 1.03)
                 else:
-                    target = float(last_price * (1 + 0.05))
+                    base_target = float(last_price * (1 + 0.05))
+            else:
+                base_target = None
 
-            # target range based on volatility: +/- vol (20d) as simple uncertainty
+            target = base_target
             target_low = None
             target_high = None
             expected_return_pct = None
             if target is not None and last_price is not None:
-                # use volatility fraction to define range
-                # ensure vol isn't unreasonably small
-                vol_factor = max(volatility, 0.01)  # min 1% to avoid 0
-                target_low = float(target * (1 - vol_factor))
-                target_high = float(target * (1 + vol_factor))
+                # target range: +/- atr_pct * multiplier (use 1.0 by default)
+                mult = 1.0
+                atr_used = max(atr_pct, 0.01)
+                target_low = float(target * (1 - atr_used * mult))
+                target_high = float(target * (1 + atr_used * mult))
                 expected_return_pct = float((target / last_price - 1) * 100)
 
-            # risk rating
-            risk = self._risk_rating(final_score, volatility)
-
-            # sector
+            risk = self._risk_rating(final_score, atr_pct)
             sector = self.sectors.get(sym, "Unknown")
-
-            # short rationale
             rationale = self._rationale_from_signals(signals)
 
             scored[sym] = {
@@ -235,13 +203,12 @@ class StockScreener:
                 "target_low": target_low,
                 "target_high": target_high,
                 "expected_return_pct": None if expected_return_pct is None else round(expected_return_pct, 2),
-                "volatility": round(float(volatility), 4),
+                "volatility": round(float(atr_pct), 4),
                 "risk": risk,
                 "sector": sector,
                 "rationale": rationale
             }
 
-        # Sort all and pick top N
         items = sorted(scored.values(), key=lambda x: x["score"], reverse=True)
         top_n = {"daily": 5, "weekly": 10, "monthly": 20}.get(mode, 5)
         return {"all": items, "top": items[:top_n]}

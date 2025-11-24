@@ -36,10 +36,8 @@ jobs:
         run: |
           python main.py --mode weekly
 
-      - name: Commit reports back to repo
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add reports || true
-          git commit -m "Auto: weekly reports $(date -u +"%Y-%m-%d")" || echo "No changes to commit"
-          git push origin HEAD:$(git rev-parse --abbrev-ref HEAD)
+      - name: Upload reports artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ github.run_id }}
+          path: reports/
